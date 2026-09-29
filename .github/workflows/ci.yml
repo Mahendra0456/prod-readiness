@@ -1,9 +1,13 @@
-name: CI-CD
+name: Production Readiness CI/CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,39 +21,46 @@ jobs:
   # 1. SECURITY CHECKS
   # ==========================================
   security-checks:
+    name: Security Checks
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       # ------------------------------
       # Secret Scanning
       # ------------------------------
-      - name: Secret scan
-        uses: gitleaks/gitleaks-action@v2
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # ------------------------------
       # Dockerfile Lint
       # ------------------------------
-      - name: Dockerfile lint
-        uses: hadolint/hadolint-action@v3.1.0
+      - name: Hadolint Dockerfile scan
+        uses: hadolint/hadolint-action@v3.4.0
         with:
           dockerfile: Dockerfile
+          failure-threshold: warning
 
       # ------------------------------
       # Node.js Setup
       # ------------------------------
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: "20"
           cache: npm
+
+      # ------------------------------
+      # Install Dependencies
+      # ------------------------------
+      - name: Install dependencies
+        run: npm ci
 
       # ------------------------------
       # Dependency Security Scan
@@ -62,101 +73,128 @@ jobs:
   # 2. BUILD → TRIVY SCAN → DOCKER HUB
   # ==========================================
   build-scan-push:
+    name: Build, Scan and Push
     needs: security-checks
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ------------------------------
-      # Docker Build
+      # Docker Buildx
+      # ------------------------------
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # ------------------------------
+      # Build Image
       # ------------------------------
       - name: Build Docker image
         run: |
           docker build \
-            -t $IMAGE:${{ github.sha }} \
-            -t $IMAGE:latest \
+            -t "${IMAGE}:${{ github.sha }}" \
+            -t "${IMAGE}:latest" \
             .
 
       # ------------------------------
-      # Trivy Security Scan
+      # Trivy Image Scan
       # ------------------------------
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.36.0 
-    with:
-          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
-          severity: HIGH,CRITICAL
-          exit-code: '1'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: "${{ env.IMAGE }}:${{ github.sha }}"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
           ignore-unfixed: true
 
       # ------------------------------
       # Docker Hub Login
       # ------------------------------
       - name: Login to Docker Hub
-        if: github.ref == 'refs/heads/main'
-        run: |
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
-          docker login \
-            -u "${{ secrets.DOCKERHUB_USERNAME }}" \
-            --password-stdin
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # ------------------------------
-      # Push Images
+      # Push SHA Image
       # ------------------------------
-      - name: Push Docker image
-        if: github.ref == 'refs/heads/main'
+      - name: Push SHA image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          docker push $IMAGE:${{ github.sha }}
-          docker push $IMAGE:latest
+          docker push "${IMAGE}:${{ github.sha }}"
+
+      # ------------------------------
+      # Push Latest Image
+      # ------------------------------
+      - name: Push latest image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "${IMAGE}:latest"
 
 
   # ==========================================
   # 3. DEPLOY TO EC2
   # ==========================================
   deploy:
+    name: Deploy to EC2
     needs: build-scan-push
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
 
-      # ------------------------------
-      # SSH into EC2
-      # ------------------------------
-      - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Deploy application to EC2
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-
+          script_stop: true
           script: |
+            set -e
 
-            # Pull the exact image built by this commit
-            docker pull ${{ env.IMAGE }}:${{ github.sha }}
+            echo "========================================"
+            echo "Starting production deployment"
+            echo "========================================"
 
-            # Remove old container
-            docker rm -f app || true
+            echo "Logging into Docker Hub..."
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login \
+              -u "${{ secrets.DOCKERHUB_USERNAME }}" \
+              --password-stdin
 
-            # Start new container
+            echo "Pulling image..."
+            docker pull "${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:${{ github.sha }}"
+
+            echo "Stopping old container..."
+            docker rm -f prod-readiness-app || true
+
+            echo "Starting new container..."
             docker run -d \
-              --name app \
+              --name prod-readiness-app \
               --restart unless-stopped \
               -p 80:3000 \
               --read-only \
               --cap-drop ALL \
-              --security-opt no-new-privileges \
+              --security-opt no-new-privileges:true \
               --memory 256m \
               --cpus 0.5 \
-              ${{ env.IMAGE }}:${{ github.sha }}
+              "${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:${{ github.sha }}"
 
+            echo "Waiting for application..."
+            sleep 10
 
-      # ------------------------------
-      # Post Deployment Health Check
-      # ------------------------------
-      - name: Health check
-        run: |
-          sleep 10
-          curl -f http://${{ secrets.EC2_HOST }}/health
+            echo "Checking container..."
+            docker ps --filter "name=prod-readiness-app"
+
+            echo "Checking application health..."
+            curl --fail --max-time 10 http://localhost/health
+
+            echo "Checking container user..."
+            docker exec prod-readiness-app id
+
+            echo "========================================"
+            echo "Deployment successful"
+            echo "========================================"
