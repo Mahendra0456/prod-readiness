@@ -84,8 +84,8 @@ jobs:
       # Trivy Security Scan
       # ------------------------------
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.36.0
-        with:
+        uses: aquasecurity/trivy-action@ed142fd       
+    with:
           image-ref: ${{ env.IMAGE }}:${{ github.sha }}
           severity: HIGH,CRITICAL
           exit-code: '1'
