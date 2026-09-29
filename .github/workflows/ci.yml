@@ -114,7 +114,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::977133951325:role/GitHubActionsProdReadiness
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
 
 
       # ------------------------------------------------------
