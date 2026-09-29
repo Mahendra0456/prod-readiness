@@ -116,14 +116,14 @@ jobs:
       # Trivy Docker Image Scan
       # --------------------------------------------------------
 
-      - name: Trivy Docker Image Scan
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
-          format: table
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-          ignore-unfixed: true
+     - name: Trivy Docker Image Scan
+       uses: aquasecurity/trivy-action@v0.36.0
+       with:
+         image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
+         format: table
+         severity: HIGH,CRITICAL
+         exit-code: '1'
+         ignore-unfixed: true
 
       # --------------------------------------------------------
       # Docker Hub Login
