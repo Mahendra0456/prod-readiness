@@ -11,137 +11,124 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
-  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: prod-readiness
 
 jobs:
 
-  # ==========================================
+  # ==========================================================
   # 1. SECURITY CHECKS
-  # ==========================================
+  # ==========================================================
   security-checks:
     name: Security Checks
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout source code
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      # ------------------------------
-      # Secret Scanning
-      # ------------------------------
       - name: Gitleaks secret scan
         uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ------------------------------
-      # Dockerfile Lint
-      # ------------------------------
       - name: Hadolint Dockerfile scan
         uses: hadolint/hadolint-action@v3.4.0
         with:
           dockerfile: Dockerfile
           failure-threshold: warning
 
-      # ------------------------------
-      # Node.js Setup
-      # ------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm
 
-      # ------------------------------
-      # Install Dependencies
-      # ------------------------------
       - name: Install dependencies
         run: npm ci
 
-      # ------------------------------
-      # Dependency Security Scan
-      # ------------------------------
       - name: Dependency audit
         run: npm audit --audit-level=high
 
 
-  # ==========================================
-  # 2. BUILD → TRIVY SCAN → DOCKER HUB
-  # ==========================================
+  # ==========================================================
+  # 2. BUILD → TRIVY → ECR
+  # ==========================================================
   build-scan-push:
-    name: Build, Scan and Push
+    name: Build, Scan and Push to ECR
     needs: security-checks
+
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout source code
         uses: actions/checkout@v6
 
-      # ------------------------------
-      # Docker Buildx
-      # ------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # ------------------------------
-      # Build Image
-      # ------------------------------
       - name: Build Docker image
         run: |
           docker build \
-            -t "${IMAGE}:${{ github.sha }}" \
-            -t "${IMAGE}:latest" \
+            -t "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" \
+            -t "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest" \
             .
 
-      # ------------------------------
-      # Trivy Image Scan
-      # ------------------------------
-      - name: Trivy image scan
+      - name: Trivy image security scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: "${{ env.IMAGE }}:${{ github.sha }}"
+          image-ref: "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
           severity: "HIGH,CRITICAL"
           exit-code: "1"
           ignore-unfixed: true
 
-      # ------------------------------
-      # Docker Hub Login
-      # ------------------------------
-      - name: Login to Docker Hub
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # ------------------------------
-      # Push SHA Image
-      # ------------------------------
-      - name: Push SHA image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Push SHA image to ECR
         run: |
-          docker push "${IMAGE}:${{ github.sha }}"
+          docker push \
+            "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
 
-      # ------------------------------
-      # Push Latest Image
-      # ------------------------------
-      - name: Push latest image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Push latest image to ECR
         run: |
-          docker push "${IMAGE}:latest"
+          docker push \
+            "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
 
 
-  # ==========================================
-  # 3. DEPLOY TO EC2
-  # ==========================================
+  # ==========================================================
+  # 3. DEPLOY TO EC2 FROM ECR
+  # ==========================================================
   deploy:
     name: Deploy to EC2
     needs: build-scan-push
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+
     runs-on: ubuntu-latest
 
     steps:
@@ -152,6 +139,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+
           script: |
             set -e
 
@@ -159,18 +147,39 @@ jobs:
             echo "Starting production deployment"
             echo "========================================"
 
-            echo "Logging into Docker Hub..."
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login \
-              -u "${{ secrets.DOCKERHUB_USERNAME }}" \
-              --password-stdin
+            echo "Checking AWS identity..."
+            aws sts get-caller-identity
 
-            echo "Pulling image..."
-            docker pull "${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:${{ github.sha }}"
+            echo "Getting AWS account ID..."
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+              --query Account \
+              --output text)
+
+            ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com"
+            ECR_REPOSITORY="prod-readiness"
+            IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }}"
+
+            echo "ECR Registry: ${ECR_REGISTRY}"
+            echo "Image: ${IMAGE}"
+
+            echo "Logging into Amazon ECR..."
+
+            aws ecr get-login-password \
+              --region ap-south-1 | \
+              docker login \
+              --username AWS \
+              --password-stdin "${ECR_REGISTRY}"
+
+            echo "Pulling image from ECR..."
+
+            docker pull "${IMAGE}"
 
             echo "Stopping old container..."
+
             docker rm -f prod-readiness-app || true
 
             echo "Starting new container..."
+
             docker run -d \
               --name prod-readiness-app \
               --restart unless-stopped \
@@ -180,19 +189,40 @@ jobs:
               --security-opt no-new-privileges:true \
               --memory 256m \
               --cpus 0.5 \
-              "${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:${{ github.sha }}"
+              "${IMAGE}"
 
             echo "Waiting for application..."
+
             sleep 10
 
             echo "Checking container..."
+
             docker ps --filter "name=prod-readiness-app"
 
             echo "Checking application health..."
-            curl --fail --max-time 10 http://localhost/health
+
+            curl --fail \
+              --max-time 10 \
+              http://localhost/health
 
             echo "Checking container user..."
+
             docker exec prod-readiness-app id
+
+            echo "Checking read-only filesystem..."
+
+            docker inspect prod-readiness-app \
+              --format '{{.HostConfig.ReadonlyRootfs}}'
+
+            echo "Checking dropped capabilities..."
+
+            docker inspect prod-readiness-app \
+              --format '{{.HostConfig.CapDrop}}'
+
+            echo "Checking security options..."
+
+            docker inspect prod-readiness-app \
+              --format '{{.HostConfig.SecurityOpt}}'
 
             echo "========================================"
             echo "Deployment successful"
