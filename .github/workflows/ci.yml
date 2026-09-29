@@ -11,82 +11,104 @@ on:
 
   workflow_dispatch:
 
-# GitHub OIDC permissions
+
+# ============================================================
+# GITHUB TOKEN / OIDC PERMISSIONS
+# ============================================================
+
 permissions:
   contents: read
   id-token: write
 
+
+# ============================================================
+# GLOBAL VARIABLES
+# ============================================================
+
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: prod-readiness
   DOCKER_IMAGE: prod-readiness
 
 
 jobs:
 
-  # ============================================================
+  # ==========================================================
   # 1. SECURITY CHECKS
-  # ============================================================
+  # ==========================================================
 
   security-checks:
     name: Security Checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
+
+      # ------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------
 
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # --------------------------------------------------------
-      # Gitleaks - Secret Detection
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
+      # Gitleaks
+      # ------------------------------------------------------
 
       - name: Gitleaks Secret Scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # --------------------------------------------------------
-      # Hadolint - Dockerfile Security/Lint
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
+      # Hadolint
+      # ------------------------------------------------------
 
       - name: Hadolint Dockerfile Scan
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
 
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
       # Trivy Filesystem Scan
-      # --------------------------------------------------------
+      # ------------------------------------------------------
 
       - name: Trivy Filesystem Scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
           scanners: vuln,secret,misconfig
           severity: HIGH,CRITICAL
-          exit-code: '1'
           ignore-unfixed: true
+          exit-code: '1'
 
 
-  # ============================================================
-  # 2. BUILD + TRIVY IMAGE SCAN + DOCKERHUB PUSH
-  # ============================================================
+  # ==========================================================
+  # 2. BUILD + TRIVY IMAGE SCAN + DOCKER HUB PUSH
+  # ==========================================================
 
   build-scan-push:
-    name: Build, Scan and Push
-    runs-on: ubuntu-latest
-    needs: security-checks
+    name: Build Scan and Push
+    runs-on: ubuntu-24.04
+
+    needs:
+      - security-checks
 
     steps:
+
+      # ------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------
 
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # --------------------------------------------------------
-      # AWS OIDC Authentication
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
+      # AWS OIDC
+      # ------------------------------------------------------
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -94,17 +116,19 @@ jobs:
           role-to-assume: arn:aws:iam::977133951325:role/GitHubActionsProdReadiness
           aws-region: ${{ env.AWS_REGION }}
 
-      # --------------------------------------------------------
-      # Verify AWS Identity
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
+      # Verify AWS OIDC
+      # ------------------------------------------------------
 
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
       # Docker Build
-      # --------------------------------------------------------
+      # ------------------------------------------------------
 
       - name: Build Docker image
         run: |
@@ -112,22 +136,25 @@ jobs:
             -t "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}" \
             .
 
-      # --------------------------------------------------------
-      # Trivy Docker Image Scan
-      # --------------------------------------------------------
 
-     - name: Trivy Docker Image Scan
-       uses: aquasecurity/trivy-action@v0.36.0
-       with:
-         image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
-         format: table
-         severity: HIGH,CRITICAL
-         exit-code: '1'
-         ignore-unfixed: true
+      # ------------------------------------------------------
+      # Trivy Image Scan
+      # ------------------------------------------------------
 
-      # --------------------------------------------------------
+      - name: Trivy Docker Image Scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}"
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+
+      # ------------------------------------------------------
       # Docker Hub Login
-      # --------------------------------------------------------
+      # ------------------------------------------------------
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -135,9 +162,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # --------------------------------------------------------
-      # Push Docker Image
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
+      # Push Image
+      # ------------------------------------------------------
 
       - name: Push Docker image
         run: |
@@ -145,16 +173,22 @@ jobs:
             "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}"
 
 
-  # ============================================================
+  # ==========================================================
   # 3. DEPLOY TO EC2
-  # ============================================================
+  # ==========================================================
 
   deploy:
     name: Deploy to EC2
-    runs-on: ubuntu-latest
-    needs: build-scan-push
+    runs-on: ubuntu-24.04
+
+    needs:
+      - build-scan-push
 
     steps:
+
+      # ------------------------------------------------------
+      # AWS OIDC
+      # ------------------------------------------------------
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -162,17 +196,19 @@ jobs:
           role-to-assume: arn:aws:iam::977133951325:role/GitHubActionsProdReadiness
           aws-region: ${{ env.AWS_REGION }}
 
-      # --------------------------------------------------------
-      # Verify AWS OIDC
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
+      # Verify AWS Identity
+      # ------------------------------------------------------
 
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
-      # --------------------------------------------------------
-      # Deploy through SSH
-      # --------------------------------------------------------
+
+      # ------------------------------------------------------
+      # Deploy to EC2
+      # ------------------------------------------------------
 
       - name: Deploy application to EC2
         uses: appleboy/ssh-action@v1.2.0
@@ -184,20 +220,25 @@ jobs:
           script: |
             set -e
 
-            echo "===================================="
-            echo "Starting deployment"
-            echo "===================================="
+            echo "========================================"
+            echo "Starting Production Deployment"
+            echo "========================================"
 
             IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:${{ github.sha }}"
 
-            echo "Pulling image:"
+            echo "Docker image:"
             echo "$IMAGE"
+
+            echo "Pulling new image..."
 
             docker pull "$IMAGE"
 
             echo "Stopping old container..."
 
             docker stop prod-readiness 2>/dev/null || true
+
+            echo "Removing old container..."
+
             docker rm prod-readiness 2>/dev/null || true
 
             echo "Starting new container..."
@@ -217,35 +258,38 @@ jobs:
 
             sleep 10
 
-            echo "Checking container..."
+            echo "Container status:"
 
-            docker ps --filter "name=prod-readiness"
+            docker ps \
+              --filter "name=prod-readiness"
 
-            echo "Checking application health..."
+            echo "Testing application health..."
 
             curl -f http://localhost/health
 
-            echo "===================================="
-            echo "Deployment successful"
-            echo "===================================="
+            echo "========================================"
+            echo "Deployment Successful"
+            echo "========================================"
 
 
-  # ============================================================
+  # ==========================================================
   # 4. FINAL HEALTH CHECK
-  # ============================================================
+  # ==========================================================
 
   health-check:
-    name: Final Deployment Check
-    runs-on: ubuntu-latest
-    needs: deploy
+    name: Final Health Check
+    runs-on: ubuntu-24.04
+
+    needs:
+      - deploy
 
     steps:
 
       - name: Deployment completed
         run: |
-          echo "===================================="
-          echo "Production deployment completed"
-          echo "===================================="
+          echo "========================================"
+          echo "Production Deployment Completed"
+          echo "========================================"
 
           echo "Application:"
           echo "prod-readiness"
@@ -256,4 +300,5 @@ jobs:
           echo "AWS Region:"
           echo "${{ env.AWS_REGION }}"
 
-          echo "Deployment status: SUCCESS"
+          echo "Status:"
+          echo "SUCCESS"
