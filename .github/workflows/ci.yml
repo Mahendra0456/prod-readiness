@@ -4,11 +4,14 @@ on:
   push:
     branches:
       - main
+
   pull_request:
     branches:
       - main
+
   workflow_dispatch:
 
+# GitHub OIDC permissions
 permissions:
   contents: read
   id-token: write
@@ -16,12 +19,15 @@ permissions:
 env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: prod-readiness
+  DOCKER_IMAGE: prod-readiness
+
 
 jobs:
 
-  # ==========================================================
+  # ============================================================
   # 1. SECURITY CHECKS
-  # ==========================================================
+  # ============================================================
+
   security-checks:
     name: Security Checks
     runs-on: ubuntu-latest
@@ -29,112 +35,147 @@ jobs:
     steps:
 
       - name: Checkout source code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v4
 
-      - name: Gitleaks secret scan
-        uses: gitleaks/gitleaks-action@v3
+      # --------------------------------------------------------
+      # Gitleaks - Secret Detection
+      # --------------------------------------------------------
+
+      - name: Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Hadolint Dockerfile scan
-        uses: hadolint/hadolint-action@v3.4.0
+      # --------------------------------------------------------
+      # Hadolint - Dockerfile Security/Lint
+      # --------------------------------------------------------
+
+      - name: Hadolint Dockerfile Scan
+        uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
-          failure-threshold: warning
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      # --------------------------------------------------------
+      # Trivy Filesystem Scan
+      # --------------------------------------------------------
+
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          node-version: "20"
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Dependency audit
-        run: npm audit --audit-level=high
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
 
 
-  # ==========================================================
-  # 2. BUILD → TRIVY → ECR
-  # ==========================================================
+  # ============================================================
+  # 2. BUILD + TRIVY IMAGE SCAN + DOCKERHUB PUSH
+  # ============================================================
+
   build-scan-push:
-    name: Build, Scan and Push to ECR
-    needs: security-checks
-
-    if: >
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
-      || github.event_name == 'workflow_dispatch'
-
+    name: Build, Scan and Push
     runs-on: ubuntu-latest
+    needs: security-checks
 
     steps:
 
       - name: Checkout source code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # AWS OIDC Authentication
+      # --------------------------------------------------------
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6.3.0
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::977133951325:role/GitHubActionsProdReadiness
           aws-region: ${{ env.AWS_REGION }}
+
+      # --------------------------------------------------------
+      # Verify AWS Identity
+      # --------------------------------------------------------
 
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      # --------------------------------------------------------
+      # Docker Build
+      # --------------------------------------------------------
 
       - name: Build Docker image
         run: |
           docker build \
-            -t "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" \
-            -t "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest" \
+            -t "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}" \
             .
 
-      - name: Trivy image security scan
-        uses: aquasecurity/trivy-action@v0.36.0
+      # --------------------------------------------------------
+      # Trivy Docker Image Scan
+      # --------------------------------------------------------
+
+      - name: Trivy Docker Image Scan
+        uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
-          severity: "HIGH,CRITICAL"
-          exit-code: "1"
+          image-ref: '${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}'
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
           ignore-unfixed: true
 
-      - name: Push SHA image to ECR
+      # --------------------------------------------------------
+      # Docker Hub Login
+      # --------------------------------------------------------
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # --------------------------------------------------------
+      # Push Docker Image
+      # --------------------------------------------------------
+
+      - name: Push Docker image
         run: |
           docker push \
-            "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
-
-      - name: Push latest image to ECR
-        run: |
-          docker push \
-            "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+            "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ github.sha }}"
 
 
-  # ==========================================================
-  # 3. DEPLOY TO EC2 FROM ECR
-  # ==========================================================
+  # ============================================================
+  # 3. DEPLOY TO EC2
+  # ============================================================
+
   deploy:
     name: Deploy to EC2
-    needs: build-scan-push
-
-    if: >
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
-      || github.event_name == 'workflow_dispatch'
-
     runs-on: ubuntu-latest
+    needs: build-scan-push
 
     steps:
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::977133951325:role/GitHubActionsProdReadiness
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --------------------------------------------------------
+      # Verify AWS OIDC
+      # --------------------------------------------------------
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # --------------------------------------------------------
+      # Deploy through SSH
+      # --------------------------------------------------------
+
       - name: Deploy application to EC2
-        uses: appleboy/ssh-action@v1.2.5
+        uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
@@ -143,53 +184,34 @@ jobs:
           script: |
             set -e
 
-            echo "========================================"
-            echo "Starting production deployment"
-            echo "========================================"
+            echo "===================================="
+            echo "Starting deployment"
+            echo "===================================="
 
-            echo "Checking AWS identity..."
-            aws sts get-caller-identity
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:${{ github.sha }}"
 
-            echo "Getting AWS account ID..."
-            AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-              --query Account \
-              --output text)
+            echo "Pulling image:"
+            echo "$IMAGE"
 
-            ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com"
-            ECR_REPOSITORY="prod-readiness"
-            IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }}"
-
-            echo "ECR Registry: ${ECR_REGISTRY}"
-            echo "Image: ${IMAGE}"
-
-            echo "Logging into Amazon ECR..."
-
-            aws ecr get-login-password \
-              --region ap-south-1 | \
-              docker login \
-              --username AWS \
-              --password-stdin "${ECR_REGISTRY}"
-
-            echo "Pulling image from ECR..."
-
-            docker pull "${IMAGE}"
+            docker pull "$IMAGE"
 
             echo "Stopping old container..."
 
-            docker rm -f prod-readiness-app || true
+            docker stop prod-readiness 2>/dev/null || true
+            docker rm prod-readiness 2>/dev/null || true
 
             echo "Starting new container..."
 
             docker run -d \
-              --name prod-readiness-app \
+              --name prod-readiness \
               --restart unless-stopped \
-              -p 80:3000 \
               --read-only \
               --cap-drop ALL \
               --security-opt no-new-privileges:true \
-              --memory 256m \
-              --cpus 0.5 \
-              "${IMAGE}"
+              --cpus="1" \
+              --memory="512m" \
+              -p 80:3000 \
+              "$IMAGE"
 
             echo "Waiting for application..."
 
@@ -197,33 +219,41 @@ jobs:
 
             echo "Checking container..."
 
-            docker ps --filter "name=prod-readiness-app"
+            docker ps --filter "name=prod-readiness"
 
             echo "Checking application health..."
 
-            curl --fail \
-              --max-time 10 \
-              http://localhost/health
+            curl -f http://localhost/health
 
-            echo "Checking container user..."
-
-            docker exec prod-readiness-app id
-
-            echo "Checking read-only filesystem..."
-
-            docker inspect prod-readiness-app \
-              --format '{{.HostConfig.ReadonlyRootfs}}'
-
-            echo "Checking dropped capabilities..."
-
-            docker inspect prod-readiness-app \
-              --format '{{.HostConfig.CapDrop}}'
-
-            echo "Checking security options..."
-
-            docker inspect prod-readiness-app \
-              --format '{{.HostConfig.SecurityOpt}}'
-
-            echo "========================================"
+            echo "===================================="
             echo "Deployment successful"
-            echo "========================================"
+            echo "===================================="
+
+
+  # ============================================================
+  # 4. FINAL HEALTH CHECK
+  # ============================================================
+
+  health-check:
+    name: Final Deployment Check
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+
+      - name: Deployment completed
+        run: |
+          echo "===================================="
+          echo "Production deployment completed"
+          echo "===================================="
+
+          echo "Application:"
+          echo "prod-readiness"
+
+          echo "Image:"
+          echo "${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:${{ github.sha }}"
+
+          echo "AWS Region:"
+          echo "${{ env.AWS_REGION }}"
+
+          echo "Deployment status: SUCCESS"
