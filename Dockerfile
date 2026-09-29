@@ -1,11 +1,18 @@
-FROM node:16
+FROM node:20-alpine
 
 WORKDIR /app
 
-COPY . .
+COPY package*.json ./
 
-RUN npm install
+RUN npm ci --omit=dev
+
+COPY app.js .
+
+USER node
 
 EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health || exit 1
 
 CMD ["node", "app.js"]

@@ -1,21 +1,162 @@
-name: CI
+name: CI-CD
 
 on:
   push:
     branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness
 
 jobs:
-  build:
+
+  # ==========================================
+  # 1. SECURITY CHECKS
+  # ==========================================
+  security-checks:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
 
-      - name: Build image
-        run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:latest .
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Login
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+      # ------------------------------
+      # Secret Scanning
+      # ------------------------------
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push
-        run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/prod-readiness:latest
+      # ------------------------------
+      # Dockerfile Lint
+      # ------------------------------
+      - name: Dockerfile lint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      # ------------------------------
+      # Node.js Setup
+      # ------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # ------------------------------
+      # Dependency Security Scan
+      # ------------------------------
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+
+  # ==========================================
+  # 2. BUILD → TRIVY SCAN → DOCKER HUB
+  # ==========================================
+  build-scan-push:
+    needs: security-checks
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # ------------------------------
+      # Docker Build
+      # ------------------------------
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t $IMAGE:${{ github.sha }} \
+            -t $IMAGE:latest \
+            .
+
+      # ------------------------------
+      # Trivy Security Scan
+      # ------------------------------
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      # ------------------------------
+      # Docker Hub Login
+      # ------------------------------
+      - name: Login to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
+          docker login \
+            -u "${{ secrets.DOCKERHUB_USERNAME }}" \
+            --password-stdin
+
+      # ------------------------------
+      # Push Images
+      # ------------------------------
+      - name: Push Docker image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+
+  # ==========================================
+  # 3. DEPLOY TO EC2
+  # ==========================================
+  deploy:
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ------------------------------
+      # SSH into EC2
+      # ------------------------------
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+
+          script: |
+
+            # Pull the exact image built by this commit
+            docker pull ${{ env.IMAGE }}:${{ github.sha }}
+
+            # Remove old container
+            docker rm -f app || true
+
+            # Start new container
+            docker run -d \
+              --name app \
+              --restart unless-stopped \
+              -p 80:3000 \
+              --read-only \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --memory 256m \
+              --cpus 0.5 \
+              ${{ env.IMAGE }}:${{ github.sha }}
+
+
+      # ------------------------------
+      # Post Deployment Health Check
+      # ------------------------------
+      - name: Health check
+        run: |
+          sleep 10
+          curl -f http://${{ secrets.EC2_HOST }}/health
